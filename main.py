@@ -15,12 +15,13 @@ from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
 from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
+from typing import Literal
 
 warnings.filterwarnings("ignore")
 
 app = FastAPI(
     title="Portfolio Allocator",
-    description="Enter a budget → get an aggressive portfolio allocation.",
+    description="Enter a budget → get a portfolio allocation + performance metrics.",
     version="1.0.0",
 )
 
@@ -133,13 +134,44 @@ def get_top_cryptos(n: int) -> list:
         # Fallback list intentionally excludes stablecoins
         return ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD"][:n]
 
-def build_aggressive_universe(num_stocks=20, num_crypto=5) -> list:
-    sectors = get_sp500_sectors()
-    target = ["Information Technology", "Consumer Discretionary", "Communication Services"]
-    candidates = [t for t, s in sectors.items() if s in target]
-    stocks = get_top_tickers_by_mcap(candidates, num_stocks)
-    cryptos = get_top_cryptos(num_crypto)
+def build_universe(sectors: list[str], num_stocks: int, num_crypto: int) -> list:
+    """
+    Build the trading universe for a given risk profile.
+
+    - Filters S&P 500 by the requested GICS sectors.
+    - Selects top `num_stocks` by market cap from that filtered set.
+    - Adds top `num_crypto` cryptos by market cap (excluding stablecoins).
+    """
+    sector_filters = set(sectors)
+    sp500_sectors = get_sp500_sectors()  # {symbol -> sector}
+
+    # Keep only tickers whose sector is in the requested list.
+    candidates = [ticker for ticker, sector in sp500_sectors.items() if sector in sector_filters]
+
+    stocks = get_top_tickers_by_mcap(candidates, num_stocks) if candidates else []
+    cryptos = get_top_cryptos(num_crypto) if num_crypto > 0 else []
     return stocks + cryptos
+
+RISK_PROFILES: dict[str, dict] = {
+    "conservative": {
+        "sectors": ["Consumer Staples", "Health Care", "Utilities", "Real Estate"],
+        "num_stocks": 25,
+        "num_crypto": 0,
+        "cov": "ledoit_wolf",
+    },
+    "moderate": {
+        "sectors": ["Information Technology", "Health Care", "Industrials", "Financials", "Consumer Staples"],
+        "num_stocks": 25,
+        "num_crypto": 2,
+        "cov": "ledoit_wolf",
+    },
+    "aggressive": {
+        "sectors": ["Information Technology", "Consumer Discretionary", "Communication Services"],
+        "num_stocks": 20,
+        "num_crypto": 5,
+        "cov": "ewma",
+    },
+}
 
 # ─── Prices & Returns ─────────────────────────────────────────────────────────
 
@@ -173,42 +205,142 @@ def cov_ewma(returns: pd.DataFrame, lam=0.94) -> pd.DataFrame:
     cov = sum(w[i] * np.outer(dm[i], dm[i]) for i in range(len(w)))
     return pd.DataFrame(cov, index=returns.columns, columns=returns.columns)
 
+def cov_ledoit_wolf(returns: pd.DataFrame) -> pd.DataFrame:
+    lw = LedoitWolf().fit(returns.dropna().values)
+    return pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
+
+def compute_performance_metrics(
+    portfolio_returns: pd.Series,
+    rf_annual: float = 0.02,
+    periods_per_year: int = 252,
+) -> dict:
+    r = portfolio_returns.dropna()
+    if r.empty:
+        return {
+            "rf_annual": float(rf_annual),
+            "periods_per_year": int(periods_per_year),
+            "n_periods": 0,
+        }
+
+    equity = (1 + r).cumprod()
+    running_max = equity.cummax()
+    dd = equity / running_max - 1.0
+    max_dd = float(dd.min())
+
+    total_return = float(equity.iloc[-1] - 1.0)
+    ann_return = float((1.0 + total_return) ** (periods_per_year / len(r)) - 1.0) if len(r) > 0 else 0.0
+    ann_vol = float(r.std(ddof=1) * np.sqrt(periods_per_year)) if len(r) > 1 else 0.0
+
+    sharpe = float((ann_return - rf_annual) / ann_vol) if ann_vol > 0 else None
+
+    downside = r[r < 0]
+    downside_vol = float(downside.std(ddof=1) * np.sqrt(periods_per_year)) if len(downside) > 1 else 0.0
+    sortino = float((ann_return - rf_annual) / downside_vol) if downside_vol > 0 else None
+
+    calmar = float(ann_return / abs(max_dd)) if max_dd < 0 else None
+
+    return {
+        "rf_annual": float(rf_annual),
+        "periods_per_year": int(periods_per_year),
+        "n_periods": int(len(r)),
+        "total_return": total_return,
+        "annualized_return": ann_return,
+        "annualized_volatility": ann_vol,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown": max_dd,
+        "calmar_ratio": calmar,
+        "best_period": float(r.max()),
+        "worst_period": float(r.min()),
+        "positive_periods_pct": float((r.gt(0).sum() / len(r)) * 100.0),
+    }
+
 # ─── HRP ──────────────────────────────────────────────────────────────────────
 
 def hrp(returns: pd.DataFrame, cov: pd.DataFrame) -> pd.Series:
-    tickers = returns.columns.tolist()
-    # Guard against constant/near-constant series -> NaNs in correlation
+    """
+    Hierarchical Risk Parity (HRP) portfolio weights.
+
+    - Uses correlation-based distance + hierarchical clustering.
+    - Applies recursive bisection with inverse-variance weights inside clusters.
+    - Includes numerical guards for near-singular covariance matrices.
+    """
+    tickers = list(returns.columns)
+
+    # Basic guards / cleaning
+    returns = (
+        returns[tickers]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(how="all")
+    )
+    if len(tickers) == 0:
+        return pd.Series(dtype=float)
+    if len(tickers) == 1:
+        # Trivial 100% allocation if only one asset
+        return pd.Series({tickers[0]: 1.0})
+
+    # --- Correlation & distance matrix ----------------------------------------
     corr_df = returns.corr().fillna(0.0)
     np.fill_diagonal(corr_df.values, 1.0)
     corr = corr_df.values
-    dist = np.sqrt(0.5 * (1 - corr))
-    link = linkage(squareform(dist, checks=False), method="single")
+    dist = np.sqrt(0.5 * (1.0 - corr))
 
+    # Condensed distance form for linkage
+    condensed = squareform(dist, checks=False)
+    link = linkage(condensed, method="single")
+
+    # --- Quasi-diagonalization: get leaf order -------------------------------
     n = link.shape[0] + 1
-    def _items(node):
-        if node < n: return [int(node)]
-        return _items(int(link[node-n, 0])) + _items(int(link[node-n, 1]))
-    sorted_idx = _items(2*n - 2)
+
+    def _get_cluster_items(node: int):
+        if node < n:
+            return [int(node)]
+        left = int(link[node - n, 0])
+        right = int(link[node - n, 1])
+        return _get_cluster_items(left) + _get_cluster_items(right)
+
+    sorted_idx = _get_cluster_items(2 * n - 2)
+
+    # Ensure covariance is aligned to tickers and well-behaved
+    cov = cov.reindex(index=tickers, columns=tickers)
+    cov_values = cov.fillna(0.0).values
 
     def _cluster_var(items):
-        sub = cov.values[np.ix_(items, items)]
-        d = np.diag(sub).copy(); d[d == 0] = 1e-8
-        ivp = (1/d) / (1/d).sum()
-        return float(ivp @ sub @ ivp)
+        sub = cov_values[np.ix_(items, items)]
+        diag = np.diag(sub).copy()
+        # Guard against zeros / negative variance from numerical issues
+        diag[diag <= 0] = 1e-8
+        ivp = 1.0 / diag
+        ivp /= ivp.sum()
+        w = ivp.reshape(-1, 1)
+        var = float(w.T @ sub @ w)
+        if not np.isfinite(var):
+            return 0.0
+        return var
 
-    w = pd.Series(1.0, index=sorted_idx)
+    # --- Recursive bisection --------------------------------------------------
+    w = pd.Series(1.0, index=sorted_idx, dtype=float)
+
     def _bisect(items):
-        if len(items) == 1: return
-        mid = len(items) // 2
-        L, R = items[:mid], items[mid:]
+        if len(items) == 1:
+            return
+        split = len(items) // 2
+        L, R = items[:split], items[split:]
         vL, vR = _cluster_var(L), _cluster_var(R)
-        aL = 0.5 if (vL + vR) == 0 else 1 - vL / (vL + vR)
-        w.loc[L] *= aL; w.loc[R] *= (1 - aL)
-        _bisect(L); _bisect(R)
+        tot = vL + vR
+        if tot <= 0 or not np.isfinite(tot):
+            aL = 0.5
+        else:
+            aL = 1.0 - vL / tot
+        w.loc[L] *= aL
+        w.loc[R] *= (1.0 - aL)
+        _bisect(L)
+        _bisect(R)
+
     _bisect(list(sorted_idx))
 
     weights = pd.Series(w.values, index=[tickers[i] for i in sorted_idx])
-    weights /= weights.sum()
+    weights /= weights.sum() if weights.sum() != 0 else 1.0
     return weights.reindex(tickers).fillna(0.0)
 
 # ─── MVO (Max-Sharpe) ─────────────────────────────────────────────────────────
@@ -232,16 +364,23 @@ def mvo_max_sharpe(exp_ret: pd.Series, cov: pd.DataFrame, rf=0.02) -> pd.Series:
 class AllocateRequest(BaseModel):
     budget: float = Field(..., gt=0, description="Total investment budget in USD")
     strategy: str = Field("hrp", description="Weighting strategy: 'hrp' (default) or 'mvo'")
+    risk_profile: Literal["conservative", "moderate", "aggressive"] = Field(
+        "aggressive",
+        description="Portfolio style. Affects universe construction + covariance model.",
+    )
     start: str = Field("2023-01-01", description="History start date YYYY-MM-DD")
     end: str = Field("2025-01-01", description="History end date YYYY-MM-DD")
+    rf_annual: float = Field(0.02, ge=0.0, le=0.25, description="Annual risk-free rate used for Sharpe/Sortino")
 
     model_config = {
         "json_schema_extra": {
             "example": {
                 "budget": 50000,
                 "strategy": "hrp",
+                "risk_profile": "aggressive",
                 "start": "2023-01-01",
-                "end": "2025-01-01"
+                "end": "2025-01-01",
+                "rf_annual": 0.02,
             }
         }
     }
@@ -253,12 +392,28 @@ class Holding(BaseModel):
     latest_price: float
     units_to_buy: float
 
+class PerformanceMetrics(BaseModel):
+    rf_annual: float
+    periods_per_year: int
+    n_periods: int
+    total_return: float | None = None
+    annualized_return: float | None = None
+    annualized_volatility: float | None = None
+    sharpe_ratio: float | None = None
+    sortino_ratio: float | None = None
+    max_drawdown: float | None = None
+    calmar_ratio: float | None = None
+    best_period: float | None = None
+    worst_period: float | None = None
+    positive_periods_pct: float | None = None
+
 class AllocateResponse(BaseModel):
     budget: float
     strategy: str
     risk_profile: str
     total_holdings: int
     holdings: list[Holding]
+    performance: PerformanceMetrics
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -268,7 +423,7 @@ def health():
 
 
 @app.post("/allocate", response_model=AllocateResponse, tags=["Allocation"],
-          summary="Build an aggressive portfolio allocation")
+          summary="Build a portfolio allocation")
 def allocate(req: AllocateRequest):
     """
     Provide a **budget** in USD and receive a fully-weighted aggressive portfolio.
@@ -288,7 +443,14 @@ def allocate(req: AllocateRequest):
 
     # 1. Build universe
     try:
-        universe = build_aggressive_universe(num_stocks=20, num_crypto=5)
+        cfg = RISK_PROFILES.get(req.risk_profile)
+        if not cfg:
+            raise ValueError("Invalid risk_profile")
+        universe = build_universe(
+            sectors=cfg["sectors"],
+            num_stocks=int(cfg["num_stocks"]),
+            num_crypto=int(cfg["num_crypto"]),
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Universe build failed: {e}")
 
@@ -324,7 +486,11 @@ def allocate(req: AllocateRequest):
 
 
 
-    cov = cov_ewma(returns)   # EWMA suits the aggressive profile
+    cov_model = cfg.get("cov", "ewma")
+    if cov_model == "ledoit_wolf":
+        cov = cov_ledoit_wolf(returns)
+    else:
+        cov = cov_ewma(returns)
 
     if req.strategy == "hrp":
         weights = hrp(returns, cov)
@@ -335,6 +501,10 @@ def allocate(req: AllocateRequest):
         weights = weights.reindex(prices.columns).fillna(0.0)
 
     weights = weights / weights.sum()   # normalise to exactly 1
+
+    # 3b. Performance metrics from in-sample portfolio returns
+    port_rets = (returns * weights.reindex(returns.columns).fillna(0.0)).sum(axis=1)
+    perf = compute_performance_metrics(port_rets, rf_annual=req.rf_annual)
 
     # 4. Build response
     latest = prices.iloc[-1]
@@ -358,8 +528,9 @@ def allocate(req: AllocateRequest):
     return AllocateResponse(
         budget=req.budget,
         strategy=req.strategy,
-        risk_profile="aggressive",
+        risk_profile=req.risk_profile,
         total_holdings=len(holdings),
         holdings=holdings,
+        performance=PerformanceMetrics(**perf),
     )
     
