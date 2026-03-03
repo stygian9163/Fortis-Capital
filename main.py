@@ -24,6 +24,19 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ─── Filters / Guards ─────────────────────────────────────────────────────────
+
+# Stablecoins (and near-stable pegs) tend to dominate minimum-variance style allocators
+# like HRP. Since this API is explicitly "aggressive", we exclude them from the crypto
+# universe and also drop any near-zero-vol series before optimization.
+STABLECOIN_TICKERS = {
+    "USDT-USD", "USDC-USD", "DAI-USD", "TUSD-USD", "BUSD-USD", "USDP-USD",
+    "FDUSD-USD", "PYUSD-USD", "USDE-USD", "FRAX-USD", "LUSD-USD",
+}
+
+# Daily return std-dev below this is effectively “cash-like” for our purposes.
+MIN_DAILY_VOL = 5e-4  # 0.05% daily vol
+
 # ─── Cache ────────────────────────────────────────────────────────────────────
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
@@ -100,18 +113,25 @@ def get_top_tickers_by_mcap(tickers: list, n: int) -> list:
 
 def get_top_cryptos(n: int) -> list:
     cached = cache_get_json(f"crypto_{n}")
-    if cached: return cached
+    if cached:
+        # Older cached results may include stablecoins; filter defensively.
+        cached = [t for t in cached if t not in STABLECOIN_TICKERS]
+        return cached[:n]
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
-            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": n, "page": 1},
+            # Pull extra to allow filtering out stablecoins.
+            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": max(n * 3, 25), "page": 1},
             timeout=10,
         )
         picks = [f"{c['symbol'].upper()}-USD" for c in r.json()]
+        picks = [t for t in picks if t not in STABLECOIN_TICKERS]
+        picks = picks[:n]
         cache_set_json(f"crypto_{n}", picks)
         return picks
     except:
-        return ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD"][:n]
+        # Fallback list intentionally excludes stablecoins
+        return ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD"][:n]
 
 def build_aggressive_universe(num_stocks=20, num_crypto=5) -> list:
     sectors = get_sp500_sectors()
@@ -157,7 +177,10 @@ def cov_ewma(returns: pd.DataFrame, lam=0.94) -> pd.DataFrame:
 
 def hrp(returns: pd.DataFrame, cov: pd.DataFrame) -> pd.Series:
     tickers = returns.columns.tolist()
-    corr = returns.corr().values
+    # Guard against constant/near-constant series -> NaNs in correlation
+    corr_df = returns.corr().fillna(0.0)
+    np.fill_diagonal(corr_df.values, 1.0)
+    corr = corr_df.values
     dist = np.sqrt(0.5 * (1 - corr))
     link = linkage(squareform(dist, checks=False), method="single")
 
@@ -277,6 +300,30 @@ def allocate(req: AllocateRequest):
 
     # 3. Compute weights
     returns = prices.pct_change().dropna()
+
+    # Drop “cash-like” / degenerate series that can dominate HRP (e.g. stablecoins).
+    vol = returns.std(numeric_only=True)
+    keep = vol[vol >= MIN_DAILY_VOL].index
+    returns = returns[keep]
+    prices = prices[keep]
+    if returns.shape[1] < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Not enough non-stable/non-degenerate assets with price data. Try a wider date range.",
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
     cov = cov_ewma(returns)   # EWMA suits the aggressive profile
 
     if req.strategy == "hrp":
