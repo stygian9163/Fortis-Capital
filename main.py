@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import pandas as pd
 import numpy as np
-import time, os, json, hashlib, warnings
+import time, os, json, hashlib, warnings, io
 import requests
 import yfinance as yf
 from scipy.cluster.hierarchy import linkage
@@ -70,7 +70,8 @@ def get_sp500_sectors():
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
             headers={"User-Agent": "Mozilla/5.0"}, timeout=10
         )
-        df = pd.read_html(r.text)[0]
+        # Wrap HTML in StringIO so pandas doesn't misinterpret it as a file path
+        df = pd.read_html(io.StringIO(r.text))[0]
         df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
         result = df.set_index("Symbol")["GICS Sector"].to_dict()
         cache_set_json("sp500_sectors", result)
